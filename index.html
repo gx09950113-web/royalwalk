@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Royal Walk 互動地圖 · Admin 版</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .topbar{
+      position:fixed; left:12px; top:12px; z-index:9999;
+      background:rgba(11,18,32,.85); color:#e6eefc;
+      padding:10px 12px; border-radius:12px; border:1px solid #223355;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Arial;
+      display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    }
+    .topbar button{ margin-right:0 }
+    .pill{ display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:4px 8px; border-radius:999px; border:1px solid #2b406a; background:#0e1628; color:#cfe8ff }
+    .pill input[type="color"]{ width:24px; height:18px; padding:0; border:none; background:transparent; cursor:pointer }
+    .errorbox{
+      position:fixed; right:12px; bottom:12px; z-index:9999;
+      max-width:48ch; background:#2b1e1e; color:#ffdede; padding:10px 12px; border:1px solid #5d2b2b; border-radius:10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap;
+    }
+    /* 彩色圓點標記樣式 */
+    .u-dot { background: transparent; border: none; }
+    .u-dot .dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
+    /* 名稱標籤樣式 */
+    .leaflet-tooltip.mlabel { background: rgba(0,0,0,0.55); color:#fff; border:0; border-radius:6px; padding:2px 6px; font-size:12px; pointer-events:none; white-space:nowrap; }
+  </style>
+</head>
+<body>
+
+  <div class="topbar">
+    <span class="pill" id="uid">未登入</span>
+    <span class="pill" id="roleTag">角色：訪客</span>
+    <span class="pill">房間：<span id="roomName">default</span></span>
+    <label class="pill">我的顏色 <input id="myColor" type="color" value="#ffcc00" title="我的標記顏色"></label>
+    <button id="btnAdd">＋ 在點擊處新增標記</button>
+    <button id="btnEdit" disabled>✎ 編輯選取標記</button>
+    <button id="btnDel" disabled>🗑 刪除選取標記</button>
+    <span class="pill" id="ownerTag">擁有者：—</span>
+    <span class="pill">提示：點地圖→按「＋」新增；拖曳可移動</span>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- 1) Leaflet：一定把底圖畫出來（royal-walk.png 1162×843） -->
+  <script>
+    function showError(msg){
+      let box = document.getElementById('err');
+      if(!box){ box = document.createElement('div'); box.id='err'; box.className='errorbox'; document.body.appendChild(box); }
+      box.textContent = msg;
+    }
+    window.addEventListener('error', e => showError('JS Error: ' + e.message));
+    window.addEventListener('unhandledrejection', e => showError('Promise Error: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+
+    const W = 1162, H = 843, IMG = 'royal-walk.png';
+    const map = L.map('map', { crs: L.CRS.Simple, minZoom: -3, wheelPxPerZoomLevel: 80, zoomSnap: 0.25 });
+    const sw = L.point(0, H), ne = L.point(W, 0);
+    const bounds = L.latLngBounds(map.unproject(sw, 0), map.unproject(ne, 0));
+    L.imageOverlay(IMG, bounds).addTo(map);
+    map.fitBounds(bounds);
+
+    const toLatLng = (x, y) => map.unproject(L.point(x, y), 0);
+    const toXY     = (latlng) => map.project(latlng, 0);
+
+    const markers = new Map(); // id -> Leaflet marker（加上自訂 m.__uid ）
+    let selectedId = null;     // 目前選取標記 id
+    let pendingLatLng = null;  // 點地圖之後待新增的位置
+
+    map.on('click', (e) => {
+      pendingLatLng = e.latlng;
+      L.popup().setLatLng(e.latlng).setContent('已選座標：按「＋」新增標記').openOn(map);
+    });
+
+    function setOwnerUI(text){ const el = document.getElementById('ownerTag'); if(el) el.textContent = '擁有者：' + text; }
+
+    window.__leafletCtx = {
+      map, toLatLng, toXY, markers, bounds,
+      getSelectedId: ()=>selectedId,
+      setSelectedId: (id)=>{ selectedId=id; updateButtons(); },
+      getPendingLatLng: ()=>pendingLatLng,
+      clearPending: ()=>{ pendingLatLng=null; },
+      setUidText: (t)=>{ const el=document.getElementById('uid'); if(el) el.textContent=t; },
+      setRoleText: (t)=>{ const el=document.getElementById('roleTag'); if(el) el.textContent='角色：'+t; },
+      setOwnerUI,
+    };
+
+    function updateButtons(){
+      const edit = document.getElementById('btnEdit');
+      const del  = document.getElementById('btnDel');
+      const id = selectedId;
+      if(!id){ edit.disabled = true; del.disabled = true; setOwnerUI('—'); return; }
+      const m = markers.get(id);
+      const owner = m && m.__uid ? m.__uid.slice(0,8) : '—';
+      setOwnerUI(owner);
+    }
+  </script>
+
+  <!-- 2) Firebase：多人即時同步 + Admin 權限 + 每人顏色（docChanges 逐筆同步 + 常駐名稱） -->
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+    import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+    import { getFirestore, collection, doc, addDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+    // === 你的 Firebase 專案設定（延用前一版） ===
+    const firebaseConfig = {
+      apiKey: "AIzaSyBFo_yIVjcl0ylyjU9Xu5TKCsEMUmKO9aM",
+      authDomain: "royalwalk-3af37.firebaseapp.com",
+      projectId: "royalwalk-3af37",
+      storageBucket: "royalwalk-3af37.appspot.com", // 建議使用預設 appspot.com 格式
+      messagingSenderId: "1054965727476",
+      appId: "1:1054965727476:web:7132823b9008bdd0191ea1",
+      measurementId: "G-QZ31DVYMBK"
+    };
+
+    const app  = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db   = getFirestore(app);
+
+    // === Admin 設定：兩位管理員（你給的 UID） ===
+    const ADMIN_UIDS = new Set(['FqmcrTBEu6et37bj9egDcsd9aRv2']);
+    const isAdminUser = (u)=> !!(u && ADMIN_UIDS.has(u.uid));
+
+    // === 使用者顏色（UID -> 色票，可自行改色） ===
+    const PALETTE = ['#ef4444','#f97316','#f59e0b','#84cc16','#22c55e','#10b981','#06b6d4','#0ea5e9','#3b82f6','#6366f1','#a855f7','#ec4899','#14b8a6','#8b5cf6','#eab308','#fb7185'];
+    const hash = (s)=>{ let h=0; for(let i=0;i<s.length;i++){ h=(h*31 + s.charCodeAt(i))|0; } return Math.abs(h); };
+    let userColor = '#ffcc00';
+
+    const colorInput = document.getElementById('myColor');
+    const room = new URLSearchParams(location.search).get('room') || 'default';
+    document.getElementById('roomName').textContent = room;
+    const colRef = collection(db, 'rooms', room, 'markers');
+
+    const { map, toLatLng, toXY, markers, bounds,
+            getSelectedId, setSelectedId, getPendingLatLng, clearPending, setOwnerUI } = window.__leafletCtx;
+
+    const iconFor = (color)=> L.divIcon({ className: 'u-dot', html: `<div class="dot" style="background:${color}"></div>`, iconSize: [18,18], iconAnchor: [9,9] });
+
+    // 顯示名稱的工具函式：在地圖上永久顯示標記名稱
+    const setMarkerLabel = (m, title) => {
+      const txt = (title && String(title).trim()) ? String(title).trim() : '未命名';
+      const tip = m.getTooltip ? m.getTooltip() : null;
+      if (tip) tip.setContent(txt);
+      else m.bindTooltip(txt, {permanent:true, direction:'top', offset:[0,-14], className:'mlabel'});
+      m.options.title = title || '';
+    };
+
+    // 匿名登入 + 角色/顏色初始化
+    signInAnonymously(auth).catch((e)=> showError('匿名登入失敗：' + e.message));
+    onAuthStateChanged(auth, (user)=>{
+      const uidShort = user ? ('UID: ' + user.uid.slice(0,8)) : '未登入';
+      window.__leafletCtx.setUidText(uidShort);
+      window.__leafletCtx.setRoleText(isAdminUser(user) ? '管理員' : (user ? '一般' : '訪客'));
+      if (user) {
+        const saved = localStorage.getItem('myColor');
+        userColor = saved || PALETTE[ hash(user.uid) % PALETTE.length ];
+        colorInput.value = userColor;
+      }
+      // 重新評估目前選取標記是否可管理（作者或 admin）
+      const id = getSelectedId();
+      const edit = document.getElementById('btnEdit');
+      const del  = document.getElementById('btnDel');
+      if(!id){ edit.disabled=true; del.disabled=true; setOwnerUI('—'); return; }
+      const m = markers.get(id);
+      const canManage = !!(user && m && (m.__uid === user.uid || isAdminUser(user)));
+      edit.disabled = !canManage;
+      del.disabled  = !canManage;
+      setOwnerUI(m && m.__uid ? (m.__uid === user?.uid ? '本人' : (isAdminUser(user) ? '管理員' : m.__uid.slice(0,8))) : '—');
+    });
+
+    // 使用者改色：之後新增的點就用新色
+    colorInput.addEventListener('input', ()=>{
+      userColor = colorInput.value;
+      localStorage.setItem('myColor', userColor);
+    });
+
+    // ✅ 逐筆同步：新增/修改/刪除；不做全量清理
+    onSnapshot(
+      colRef,
+      (snap) => {
+        snap.docChanges().forEach((ch) => {
+          const id = ch.doc.id;
+
+          if (ch.type === 'removed') {
+            const m = markers.get(id);
+            if (m) { m.remove(); markers.delete(id); }
+            if (getSelectedId() === id) setSelectedId(null);
+            return;
+          }
+
+          const d   = ch.doc.data();             // {x,y,title,color,uid,updatedAt}
+          const ll  = toLatLng(d.x, d.y);
+          const col = d.color || '#ffcc00';
+
+          if (ch.type === 'added' && !markers.has(id)) {
+            const m = L.marker(ll, { draggable: true, title: d.title || '', icon: iconFor(col) }).addTo(map);
+            m.__uid = d.uid || '?';
+            setMarkerLabel(m, d.title);
+
+            m.on('click', () => {
+              setSelectedId(id);
+              m.openPopup();
+              const user = auth.currentUser;
+              const canManage = !!(user && (m.__uid === user.uid || isAdminUser(user)));
+              document.getElementById('btnEdit').disabled = !canManage;
+              document.getElementById('btnDel').disabled  = !canManage;
+              setOwnerUI(canManage && m.__uid !== user?.uid ? '管理員' : (m.__uid === user?.uid ? '本人' : (m.__uid ? m.__uid.slice(0,8) : '—')));
+            });
+
+            m.on('dragend', async () => {
+              const xy = toXY(m.getLatLng());
+              try {
+                // 只更新座標與時間，不改 color/title/uid
+                await setDoc(doc(colRef, id), { x: xy.x, y: xy.y, updatedAt: serverTimestamp() }, { merge: true });
+              } catch (err) { showError('更新失敗：' + err.message); }
+            });
+
+            m.bindPopup(() => `<b>${d.title||'未命名'}</b><br>x=${Math.round(d.x)}, y=${Math.round(d.y)}<br><small>ID:${id}</small>`);
+            markers.set(id, m);
+            return;
+          }
+
+          // modified（或 added 但本地已有）→ 更新內容
+          const m = markers.get(id);
+          if (!m) return; // 防呆
+          m.setLatLng(ll);
+          m.setIcon(iconFor(col));
+          setMarkerLabel(m, d.title);
+          m.__uid = d.uid || m.__uid || '?';
+          m.setPopupContent(`<b>${d.title||'未命名'}</b><br>x=${Math.round(d.x)}, y=${Math.round(d.y)}<br><small>ID:${id}</small>`);
+        });
+      },
+      (err) => showError('讀取失敗：' + err.message + '\n（通常是 Firestore 未建立或 Rules 阻擋 read）')
+    );
+
+    // 工具列按鈕
+    const $ = (id)=>document.getElementById(id);
+    $('btnAdd').onclick = async (e)=>{
+      e.preventDefault();
+      if(!auth.currentUser){ alert('尚未登入，請稍候再試'); return; }
+      const latlng = getPendingLatLng();
+      if (!latlng) { alert('先在地圖上點一下，選擇座標，再按＋'); return; }
+      const xy = toXY(latlng);
+      const title = prompt('標記標題？','新標記') || '新標記';
+      try{
+        await addDoc(colRef, {
+          x: xy.x, y: xy.y, title,
+          color: userColor,
+          uid: auth.currentUser.uid,
+          updatedAt: serverTimestamp(),
+        });
+        clearPending();
+      }catch(err){ showError('寫入失敗：' + err.message); }
+    };
+
+    $('btnEdit').onclick = async (e)=>{
+      e.preventDefault();
+      if(!auth.currentUser){ alert('尚未登入'); return; }
+      const id = getSelectedId();
+      if (!id) { alert('先點一下要編輯的標記'); return; }
+      const m = markers.get(id); if (!m) return;
+      if(!(isAdminUser(auth.currentUser) || m.__uid === auth.currentUser.uid)){
+        alert('只有作者或管理員可編輯'); return;
+      }
+      const cur = m.options.title || '';
+      const title = prompt('新的標題：', cur);
+      if (title == null) return;
+      const xy = toXY(m.getLatLng());
+      try{
+        await setDoc(doc(colRef, id), { title, x: xy.x, y: xy.y, updatedAt: serverTimestamp() }, { merge: true });
+      }catch(err){ showError('更新失敗：' + err.message); }
+    };
+
+    $('btnDel').onclick = async (e)=>{
+      e.preventDefault();
+      if(!auth.currentUser){ alert('尚未登入'); return; }
+      const id = getSelectedId();
+      if (!id) { alert('先點一下要刪除的標記'); return; }
+      const m = markers.get(id); if (!m) return;
+      if(!(isAdminUser(auth.currentUser) || m.__uid === auth.currentUser.uid)){
+        alert('只有作者或管理員可刪除'); return;
+      }
+      if (!confirm('確定刪除此標記？')) return;
+      try{
+        await deleteDoc(doc(colRef, id));
+        setSelectedId(null);
+      }catch(err){ showError('刪除失敗：' + err.message); }
+    };
+
+    map.fitBounds(bounds);
+  </script>
+
+  <!-- 提醒：請把 royal-walk.png 放在與本檔同層。若要分房：加 ?room=walk1。Rules 設定請使用「作者或 admin 可改/刪」版本。 -->
+</body>
+</html>
